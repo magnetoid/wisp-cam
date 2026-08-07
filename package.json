@@ -1,0 +1,23 @@
+{
+  "name": "c2c",
+  "private": true,
+  "type": "module",
+  "version": "0.1.0",
+  "description": "Anonymous 1-on-1 random video and text chat",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "npm run dev --workspace=server & npm run dev --workspace=client",
+    "dev:server": "npm run dev --workspace=server",
+    "dev:client": "npm run dev --workspace=client",
+    "build": "npm run build --workspace=server && npm run build --workspace=client",
+    "typecheck": "npm run typecheck --workspace=server && npm run typecheck --workspace=client",
+    "test": "npm test --workspace=server",
+    "start": "npm run start --workspace=server"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
