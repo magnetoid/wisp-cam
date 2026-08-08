@@ -1,44 +1,92 @@
-# Wisp Cam — full stack for a plain Docker host (no Coolify).
+# Wisp Cam — application stack (web + signaling).
 #
-#   cp .env.example .env   # fill in JWT_SECRET, TURN_*, domains
-#   docker compose up -d --build
+# This is the file Coolify picks up by default, and it is deliberately safe for
+# Coolify's build step:
 #
-# Put a TLS terminator (Caddy, nginx, Traefik) in front of `web` and
-# `signaling`: getUserMedia refuses to run on anything but HTTPS or localhost.
+#   * No required-variable syntax (the "VAR:?message" form) anywhere.
+#     `docker compose build`
+#     interpolates the WHOLE file, including services it is not building, and
+#     Coolify's build step is given only build-time variables — so a `:?` on any
+#     runtime variable aborts the build with "required variable X is missing",
+#     no matter what you set in the UI.
+#   * No coturn. TURN needs host networking and raw UDP, so it cannot sit behind
+#     the proxy; it is deployed separately (see deploy/coolify/coturn.compose.yml).
+#   * No top-level `networks:`. Coolify injects its own, and a second network
+#     makes Traefik route to the wrong container IP intermittently.
 #
-# Deploying on Coolify instead? Use deploy/coolify/ — the proxy, TLS and
-# routing all work differently there, and coturn has to be its own resource.
+# Required variables — set these in Coolify, or in .env for a plain Docker host:
+#   JWT_SECRET                 openssl rand -hex 32
+#   VITE_SERVER_URL            https://api.wisp.best   (tick "Build Variable")
+#   TURN_URLS                  turn:turn.wisp.best:3478?transport=udp,...
+#   TURN_STATIC_AUTH_SECRET    must match coturn exactly
+#
+# The signaling server refuses to start in production without JWT_SECRET, so a
+# missing value fails loudly at boot rather than silently.
+#
+# Plain Docker host:
+#   cp .env.example .env && docker compose up -d --build
+#   docker compose -f deploy/coturn.compose.yml up -d      # TURN, separately
+#
+# Coolify: see deploy/COOLIFY.md
 
 services:
+  web:
+    build:
+      context: .
+      dockerfile: client/Dockerfile
+      args:
+        # Vite inlines this at BUILD time. In Coolify this variable MUST have
+        # "Build Variable" ticked, or it resolves to empty here and the bundle
+        # ships pointing nowhere — with no build error to warn you.
+        VITE_SERVER_URL: ${VITE_SERVER_URL:-http://localhost:8080}
+    restart: unless-stopped
+    environment:
+      # Seeds a default domain on first deploy; the value set in the Coolify UI
+      # wins afterwards. Harmless outside Coolify.
+      - SERVICE_FQDN_WEB_80
+    ports:
+      - '${WEB_PORT:-8081}:80'
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
   signaling:
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+    depends_on:
+      - web
     environment:
-      NODE_ENV: production
-      PORT: 8080
-      DATA_DIR: /data
+      - SERVICE_FQDN_SIGNALING_8080
+      - NODE_ENV=production
+      - PORT=8080
+      - DATA_DIR=/data
 
-      # Every origin the browser loads the app from, comma-separated.
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://wisp.best}
+      # Every browser origin the app is served from, comma-separated.
+      - ALLOWED_ORIGINS=${ALLOWED_ORIGINS:-http://localhost:8081}
 
-      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
-      SESSION_TTL_SECONDS: ${SESSION_TTL_SECONDS:-21600}
+      - JWT_SECRET=${JWT_SECRET:-}
+      - SESSION_TTL_SECONDS=${SESSION_TTL_SECONDS:-21600}
 
-      # Bot gate. Unset disables it — fine locally, not in production.
-      TURNSTILE_SECRET: ${TURNSTILE_SECRET:-}
-      TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
+      # Bot gate. Unset disables it — acceptable locally, not in production.
+      - TURNSTILE_SECRET=${TURNSTILE_SECRET:-}
+      - TURNSTILE_SITE_KEY=${TURNSTILE_SITE_KEY:-}
 
-      TURN_URLS: ${TURN_URLS:-}
-      TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-}
-      TURN_TTL_SECONDS: ${TURN_TTL_SECONDS:-7200}
+      # Points at the separately-deployed coturn. Keep these runtime-only:
+      # build args are recorded in image metadata and visible in docker history.
+      - TURN_URLS=${TURN_URLS:-}
+      - TURN_STATIC_AUTH_SECRET=${TURN_STATIC_AUTH_SECRET:-}
+      - TURN_TTL_SECONDS=${TURN_TTL_SECONDS:-7200}
 
-      ABUSE_CONTACT_EMAIL: ${ABUSE_CONTACT_EMAIL:-abuse@wisp.best}
-      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-30}
+      - ABUSE_CONTACT_EMAIL=${ABUSE_CONTACT_EMAIL:-abuse@wisp.best}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
     volumes:
-      # Abuse reports, evidence frames, and ban state. Losing this loses every
-      # ban and every report awaiting review.
+      # Abuse reports, evidence frames, and ban state. Renaming this volume
+      # orphans the existing data — treat the name as immutable.
       - wisp-data:/data
     ports:
       - '${SIGNALING_PORT:-8080}:8080'
@@ -53,44 +101,5 @@ services:
       retries: 3
       start_period: 15s
 
-  web:
-    build:
-      context: .
-      dockerfile: client/Dockerfile
-      args:
-        # Inlined into the bundle at build time; changing it needs a rebuild.
-        VITE_SERVER_URL: ${VITE_SERVER_URL:-https://api.wisp.best}
-    restart: unless-stopped
-    depends_on:
-      - signaling
-    ports:
-      - '${WEB_PORT:-8081}:80'
-    healthcheck:
-      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/']
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-  coturn:
-    image: coturn/coturn:4.7-alpine
-    restart: unless-stopped
-    # Required: TURN allocates relay ports across a range, and publishing that
-    # range through Docker's userland proxy is unworkably slow. Host networking
-    # also gives the 1:1 external/internal port identity TURN depends on.
-    network_mode: host
-    volumes:
-      - ./deploy/turnserver.conf:/etc/coturn/turnserver.conf:ro
-      - coturn-data:/var/lib/coturn
-    command:
-      - -c
-      - /etc/coturn/turnserver.conf
-      - --realm=${TURN_REALM:-wisp.best}
-      - --server-name=${TURN_REALM:-wisp.best}
-      # The host's public IPv4. Wrong value here yields unreachable candidates.
-      - --external-ip=${TURN_EXTERNAL_IP:?set TURN_EXTERNAL_IP in .env}
-      - --static-auth-secret=${TURN_STATIC_AUTH_SECRET:?set TURN_STATIC_AUTH_SECRET in .env}
-
 volumes:
   wisp-data:
-  coturn-data:

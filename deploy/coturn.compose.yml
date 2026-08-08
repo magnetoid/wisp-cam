@@ -1,0 +1,34 @@
+# coturn TURN relay — for a plain Docker host.
+#
+#   docker compose -f deploy/coturn.compose.yml up -d
+#
+# On Coolify use deploy/coolify/coturn.compose.yml instead: it inlines the
+# config file, so the resource needs no Git repo attached.
+#
+# Deployed separately from the app on purpose: TURN allocates relay ports across
+# a UDP range, which no HTTP reverse proxy can carry, so it needs host
+# networking. Keeping it apart also means app redeploys don't drop live calls.
+
+services:
+  coturn:
+    image: coturn/coturn:4.7-alpine
+    restart: unless-stopped
+    # Required. Publishing a relay port range through Docker's userland proxy
+    # spawns one process per port and is unworkably slow; host networking also
+    # gives the 1:1 external/internal port identity that TURN depends on.
+    network_mode: host
+    volumes:
+      - ./turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - coturn-data:/var/lib/coturn
+    command:
+      - -c
+      - /etc/coturn/turnserver.conf
+      - --realm=${TURN_REALM:-turn.wisp.best}
+      - --server-name=${TURN_REALM:-turn.wisp.best}
+      # The host's public IPv4. A wrong value here yields ICE candidates that
+      # nobody can reach, which presents as "TURN is broken" with no error.
+      - --external-ip=${TURN_EXTERNAL_IP:-}
+      - --static-auth-secret=${TURN_STATIC_AUTH_SECRET:-}
+
+volumes:
+  coturn-data:
