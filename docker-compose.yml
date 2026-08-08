@@ -48,8 +48,11 @@ services:
       # Seeds a default domain on first deploy; the value set in the Coolify UI
       # wins afterwards. Harmless outside Coolify.
       - SERVICE_FQDN_WEB_80
-    ports:
-      - '${WEB_PORT:-8081}:80'
+    # Deliberately `expose`, not `ports`. The proxy reaches this container over
+    # the internal network, and publishing to the host collides with whatever
+    # else is running there — which is how this first failed to start.
+    expose:
+      - '80'
     healthcheck:
       test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/']
       interval: 30s
@@ -92,8 +95,8 @@ services:
       # Abuse reports, evidence frames, and ban state. Renaming this volume
       # orphans the existing data — treat the name as immutable.
       - wisp-data:/data
-    ports:
-      - '${SIGNALING_PORT:-8080}:8080'
+    expose:
+      - '8080'
     healthcheck:
       test:
         - CMD
