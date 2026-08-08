@@ -1,170 +1,157 @@
-# Deploying Wisp Cam on Coolify
+# Deploying Wisp Cam
 
-Target: **wisp.best** (app) and **api.wisp.best** (signaling), with a self-hosted
-TURN relay on **turn.wisp.best**.
+This documents the **live production setup** on `wisp.best`, as actually deployed
+and verified — not a generic recipe.
 
-Two separate Coolify resources. coturn cannot live in the app stack — it needs raw
-UDP and host networking, so the reverse proxy can't carry it, and keeping it apart
-means app redeploys don't drop live relayed calls.
+## The request path
 
----
+```
+browser ──▶ Cloudflare DNS (grey cloud, no proxy)
+        ──▶ Plesk nginx :443        TLS termination, Let's Encrypt
+        ──▶ Coolify Caddy :8445     routes by Host header
+        ──▶ container               web :80 / signaling :8080
 
-## 0. DNS
+browser ◀────────── SRTP ──────────▶ browser      direct peer-to-peer
+browser ◀── coturn :3478/:5349 ────▶ browser      when NAT blocks direct
+```
 
-Point all three at the server's public IPv4:
+Two things about this host differ from a stock Coolify box, and both matter:
+
+- **Plesk nginx owns ports 80 and 443**, not Coolify's proxy. Coolify's Caddy sits
+  behind it on `8090` (HTTP) and `8445` (HTTPS). Domains are therefore wired up in
+  *two* places: an nginx vhost, and the Coolify service domain.
+- **`iptables` INPUT policy is DROP**, managed by the Plesk firewall extension.
+  Any new port must be opened explicitly or it is silently unreachable.
+
+## DNS (Cloudflare)
+
+All records point to `65.21.238.89` and are **DNS-only (grey cloud)**:
 
 | Record | Type | Value |
 |---|---|---|
-| `wisp.best` | A | your server IP |
-| `api.wisp.best` | A | your server IP |
-| `turn.wisp.best` | A | your server IP |
+| `wisp.best` | A | 65.21.238.89 |
+| `api.wisp.best` | A | 65.21.238.89 |
+| `turn.wisp.best` | A | 65.21.238.89 |
+| `www.wisp.best` | CNAME | wisp.best |
 
-## 1. Firewall
+**Do not enable the orange cloud without changing the app first.** With Cloudflare
+proxying, every request arrives from a Cloudflare IP, so the per-IP rate limits and
+bans would apply to Cloudflare rather than to users — effectively disabling them.
+`turn.wisp.best` can never be proxied: TURN is not HTTP.
 
-Coolify's Traefik already owns 80/tcp, 443/tcp, 443/udp and 8080/tcp. TURN needs
-its own ports opened — and because coturn uses host networking, Docker does *not*
-bypass your firewall for it, so these rules genuinely apply:
+## TLS
 
-```bash
-ufw allow 3478/udp
-ufw allow 3478/tcp
-ufw allow 5349/tcp
-ufw allow 5349/udp
-ufw allow 50000:50500/udp
-```
-
-Open the same range in your provider's security group (Hetzner Cloud Firewall, AWS
-security group, etc.) — that's a separate layer and a common thing to miss.
-
-> **TURN on port 443 is not possible here.** Traefik holds 443 on both TCP and UDP
-> (HTTP/3). Clients on networks that only permit 443 will fail to relay. If that
-> matters, add a second IPv4 to the VPS and bind coturn's TLS listener to it, or
-> run coturn on a separate host.
-
-## 2. Generate secrets
+One certificate covers all four names, issued via the existing Cloudflare DNS
+plugin (no port-80 dependency):
 
 ```bash
-# Signs anonymous session tokens
-openssl rand -hex 32
-
-# Shared with coturn; never reaches the browser
-openssl rand -hex 32
+certbot certonly --dns-cloudflare \
+  --dns-cloudflare-credentials /root/.cloudflare.ini \
+  -d wisp.best -d www.wisp.best -d api.wisp.best -d turn.wisp.best \
+  --cert-name wisp.best
 ```
 
-## 3. Deploy coturn first
+## nginx vhost
 
-The app needs `TURN_STATIC_AUTH_SECRET` to match, so bring this up first.
+`/etc/nginx/conf.d/wisp.best.conf` terminates TLS and forwards to Caddy on 8445.
+It must carry the WebSocket upgrade headers or signaling silently fails, and it
+raises `proxy_read_timeout` because signaling connections are long-lived and mostly
+idle — the 60s default would cut chats off mid-conversation.
 
-**New Resource → Docker Compose Empty**, paste
-[`deploy/coolify/coturn.compose.yml`](coolify/coturn.compose.yml), and set:
+## Firewall
 
-| Variable | Value |
+TURN ports opened through Plesk so they survive a firewall re-apply:
+
+```bash
+plesk ext firewall --set-rule -name "Wisp Cam TURN" -direction input -action allow \
+  -ports "3478/tcp,3478/udp,5349/tcp,5349/udp,50000-50500/udp"
+plesk ext firewall --apply
+plesk ext firewall --confirm      # from a second SSH session
+```
+
+## coturn
+
+Runs outside Coolify at `/opt/wisp-coturn` (`docker compose`), because it needs host
+networking and raw UDP and cannot sit behind any HTTP proxy.
+
+Two things that will bite you:
+
+- **coturn drops privileges to `nobody`.** Its config file and certificates must be
+  readable by uid 65534. A root-owned `600` config is silently ignored and coturn
+  starts with *defaults* — no realm, no auth secret, no TLS. Check the logs for
+  `Cannot find config file`.
+- **`/etc/letsencrypt/live` is root-only**, so certificates are copied to
+  `/opt/wisp-coturn/certs` owned by 65534. A deploy hook at
+  `/etc/letsencrypt/renewal-hooks/deploy/wisp-coturn.sh` refreshes those copies and
+  restarts the container on renewal — without it, TURNS breaks silently in 90 days.
+
+## Coolify application
+
+Resource `wisp-cam`, build pack **Docker Compose**, compose file `/docker-compose.yml`.
+
+Per-service domains (the `:port` suffix is not part of the URL — it tells the proxy
+which container port to route to):
+
+| Service | Domain |
 |---|---|
-| `TURN_REALM` | `turn.wisp.best` |
-| `TURN_EXTERNAL_IP` | the server's public IPv4 |
-| `TURN_STATIC_AUTH_SECRET` | the second secret from step 2 |
+| `web` | `https://wisp.best:80` |
+| `signaling` | `https://api.wisp.best:8080` |
 
-**Assign no domain to this resource.** It is not behind the proxy, and a domain
-would do nothing.
+Environment variables — `VITE_SERVER_URL` **must** be marked a *Build Variable*,
+because Vite inlines it into the bundle at build time. `JWT_SECRET` and
+`TURN_STATIC_AUTH_SECRET` must **not** be build variables: build args are recorded in
+image metadata and readable via `docker history`. Secrets live at
+`/root/wisp-secrets.env` on the server.
 
-Verify after deploy:
+### Compose constraints this deployment proved the hard way
 
-```bash
-docker compose logs coturn | grep -i "relay
-\|listener"     # should show listeners on 3478/5349
-```
+Each of these caused a failed deploy:
 
-## 4. Deploy the app
+1. **No required-variable syntax (`VAR:?message`).** `docker compose build`
+   interpolates the *entire* file including services it isn't building, and Coolify's
+   build step only receives build-time variables — so a `:?` on any runtime value
+   aborts the build regardless of what is set in the UI.
+2. **`build.args` must use list syntax** when `environment` does. Coolify merges args
+   into environment; mixing mapping and list forms yields
+   `non-string key in services.web.environment`.
+3. **Use `expose:`, never `ports:`.** The proxy reaches containers over the internal
+   network. Publishing to the host collides with other services on this shared box —
+   port 8081 was already taken.
+4. **Keep `package-lock.json` in sync.** `npm ci` refuses to run if workspace names
+   have changed without regenerating the lockfile.
 
-**New Resource → Docker Compose** from the Git repo, with
-**Docker Compose Location** = `deploy/coolify/app.compose.yml`.
-
-### Domains
-
-In the resource's **General** tab, per service:
-
-| Field | Value |
-|---|---|
-| Domains for `web` | `https://wisp.best:80` |
-| Domains for `signaling` | `https://api.wisp.best:8080` |
-
-Two details that cause most first-deploy failures:
-
-- **The scheme must be `https://`.** `http://` creates only an HTTP router, no TLS
-  and no certificate — and `wss://` then cannot work.
-- **The `:port` suffix is not part of the public URL.** It is the only thing that
-  tells Traefik which container port to route to. Leave it off and Traefik guesses
-  the lowest exposed port, which produces a 502.
-
-### Environment variables
-
-| Variable | Value | Build var? |
-|---|---|---|
-| `JWT_SECRET` | first secret from step 2 | no |
-| `VITE_SERVER_URL` | `https://api.wisp.best` | **yes** |
-| `TURN_URLS` | `turn:turn.wisp.best:3478?transport=udp,turn:turn.wisp.best:3478?transport=tcp,turns:turn.wisp.best:5349?transport=tcp` | no |
-| `TURN_STATIC_AUTH_SECRET` | second secret from step 2 — must match coturn exactly | no |
-| `TURNSTILE_SECRET` | from Cloudflare Turnstile | no |
-| `TURNSTILE_SITE_KEY` | from Cloudflare Turnstile | no |
-| `ABUSE_CONTACT_EMAIL` | a mailbox someone actually reads | no |
-
-**`VITE_SERVER_URL` must have "Build Variable" ticked.** Vite inlines `VITE_*`
-values into the bundle at build time; if the flag is off the variable resolves to
-empty during the build and the app ships pointing at nothing — with no build error
-to warn you.
-
-Conversely, leave "Build Variable" **off** for `TURN_STATIC_AUTH_SECRET` and
-`JWT_SECRET`: build args are recorded in image metadata and visible in
-`docker history`.
-
-### Turn OFF gzip compression for `signaling`
-
-In the resource's **Advanced** settings, disable **Enable Gzip Compression**.
-
-Traefik's compression middleware buffers socket.io's HTTP long-polling leg and
-breaks the connection upgrade. This client already forces
-`transports: ['websocket']`, which sidesteps it, but leaving gzip on is a trap for
-any future change that re-enables polling — and it's the single most common cause
-of "WebSockets don't work behind Coolify".
-
-## 5. Verify the deployment
+## Verifying a deployment
 
 ```bash
-curl https://api.wisp.best/health
-# {"ok":true,"queues":{"video":0,"text":0},"rooms":0}
+curl https://api.wisp.best/health          # {"ok":true,...}
+curl -o /dev/null -w "%{http_code}" https://wisp.best/
 ```
 
-Then, in order:
+Then the one check that actually matters — **TURN**. Without a working relay, roughly
+one connection in five fails silently. In a browser console on `https://wisp.best`:
 
-1. **Open https://wisp.best on two devices** — ideally a phone on mobile data and a
-   laptop on Wi-Fi, which forces real NAT traversal rather than a LAN shortcut.
-2. **Confirm TURN actually works.** This is the step people skip and regret: without
-   a working relay roughly one connection in five fails, and it fails silently.
-   Paste the output of `curl -H "Authorization: Bearer <token>" https://api.wisp.best/api/ice`
-   into the [Trickle ICE tester](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/).
-   **You must see at least one candidate of type `relay`.** Only `host` and `srflx`
-   means TURN is not working, whatever the logs say.
-3. **Check the reports volume survives a redeploy** — redeploy and confirm
-   `/data/reports.jsonl` is still there. Renaming the volume in the compose file
-   orphans the old data, so treat `wisp-data` as immutable.
+```js
+const s = await (await fetch('https://api.wisp.best/api/session', {method:'POST',
+  headers:{'Content-Type':'application/json'}, body:JSON.stringify({birthDate:'1990-01-01'})})).json();
+const ice = await (await fetch('https://api.wisp.best/api/ice',
+  {headers:{Authorization:'Bearer '+s.token}})).json();
+const pc = new RTCPeerConnection({iceServers: ice.iceServers, iceTransportPolicy:'relay'});
+pc.createDataChannel('probe');
+pc.onicecandidate = e => e.candidate && console.log(e.candidate.candidate);
+await pc.setLocalDescription(await pc.createOffer());
+```
 
-## Troubleshooting
+**At least one candidate must say `typ relay`.** Nothing at all means TURN is broken,
+whatever the logs claim.
 
-| Symptom | Cause |
-|---|---|
-| 502 on `api.wisp.best` | Missing `:8080` in the domain field — Traefik guessed the port |
-| Certificate errors / no TLS | Domain entered as `http://` instead of `https://` |
-| WebSocket connects then drops | Gzip compression still enabled on `signaling` |
-| Video connects on LAN, fails across networks | TURN not reachable — check firewall and `external-ip` |
-| App loads but nothing connects | `VITE_SERVER_URL` wasn't a build variable; bundle has an empty API URL |
-| CORS errors in console | `ALLOWED_ORIGINS` doesn't match the `web` domain exactly (scheme included) |
-| `network_mode` error on coturn | Known Coolify bug on *existing* resources — delete and recreate the resource |
+## Still outstanding before promoting this publicly
 
-## Before you point real users at it
-
-- Register an NCMEC CyberTipline point of contact (free) and put a human behind
-  `ABUSE_CONTACT_EMAIL`. Reports land in `/data/reports.jsonl` and nothing reads
-  them for you.
-- See the "Known gaps" section in the [README](../README.md) — particularly that
-  on-device NSFW screening is bypassable, and that a self-declared age gate is not
-  age verification under the UK Online Safety Act.
+- **Turnstile is not configured** (`TURNSTILE_SECRET` / `TURNSTILE_SITE_KEY` are
+  empty), so the bot gate is disabled. Create keys at Cloudflare → Turnstile.
+- **`ABUSE_CONTACT_EMAIL` is `abuse@wisp.best`** — point it at a mailbox a human reads.
+- **Register an NCMEC CyberTipline contact** (free) before real traffic.
+- **Nothing reads the reports.** They accumulate in the `wisp-data` volume at
+  `/data/reports.jsonl`.
+- See the "Known gaps" section of the [README](../README.md), particularly that
+  on-device NSFW screening is bypassable and a self-declared age gate is not age
+  verification under the UK Online Safety Act.
