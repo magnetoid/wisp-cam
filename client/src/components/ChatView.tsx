@@ -89,7 +89,11 @@ export default function ChatView({ chat }: ChatViewProps) {
           <div className="searching">
             <div className="searching__pulse" aria-hidden="true" />
             <p className="searching__label">
-              {chat.status === 'connecting' ? 'Connecting…' : 'Looking for someone…'}
+              {chat.status === 'reconnecting'
+                ? 'Reconnecting…'
+                : chat.status === 'connecting'
+                  ? 'Connecting…'
+                  : 'Looking for someone…'}
             </p>
             {chat.status === 'searching' && chat.queuePosition > 1 && (
               <p className="searching__meta">#{chat.queuePosition} in line</p>
@@ -99,7 +103,13 @@ export default function ChatView({ chat }: ChatViewProps) {
 
         <header className="topbar">
           <span className={`pill ${isLive ? 'pill--live' : ''}`}>
-            {isLive ? 'Connected' : chat.status === 'connecting' ? 'Connecting' : 'Searching'}
+            {isLive
+              ? 'Connected'
+              : chat.status === 'reconnecting'
+                ? 'Reconnecting'
+                : chat.status === 'connecting'
+                  ? 'Connecting'
+                  : 'Searching'}
           </span>
           <div className="topbar__actions">
             <button

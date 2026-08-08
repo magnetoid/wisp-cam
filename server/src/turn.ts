@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { config } from './config.ts';
 import type { IceServerConfig, TurnResponse } from '../../shared/protocol.ts';
 
@@ -13,6 +14,36 @@ interface CachedCreds {
 let cache: CachedCreds | null = null;
 
 /**
+ * The coturn "TURN REST API" scheme (`use-auth-secret` / `static-auth-secret`).
+ *
+ * The username is an expiry timestamp and the password is its HMAC-SHA1 under a
+ * secret shared with coturn. coturn recomputes the HMAC to validate, so no user
+ * database is needed and a leaked credential stops working within the TTL.
+ */
+function mintCoturnCredentials(
+  urls: string[],
+  secret: string,
+  ttlSeconds: number,
+  sessionId: string,
+): TurnResponse {
+  // Username is "<unix-expiry>:<session>" — the timestamp is when the
+  // credential stops working, not when it was issued. Including the session id
+  // is optional in the spec, but it makes relay usage traceable back to a
+  // report, which matters when handling abuse.
+  const expiry = Math.floor(Date.now() / 1000) + ttlSeconds;
+  const username = `${expiry}:${sessionId}`;
+
+  // HMAC-SHA1 of the username, base64 of the raw digest — coturn recomputes
+  // this to validate, so it needs no user database.
+  const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+
+  return {
+    iceServers: [...PUBLIC_STUN, { urls, username, credential }],
+    ttl: ttlSeconds,
+  };
+}
+
+/**
  * Mints short-lived TURN credentials from Cloudflare Realtime.
  *
  * Roughly 15-20% of consumer connections cannot traverse NAT directly and need
@@ -22,8 +53,13 @@ let cache: CachedCreds | null = null;
  * Falls back to public STUN when unconfigured: fine for local development,
  * but a meaningful share of real-world connections will fail without TURN.
  */
-export async function getIceServers(): Promise<TurnResponse> {
-  const { keyId, apiToken, ttlSeconds } = config.turn;
+export async function getIceServers(sessionId: string): Promise<TurnResponse> {
+  const { keyId, apiToken, ttlSeconds, urls, staticAuthSecret } = config.turn;
+
+  // Self-hosted coturn takes precedence: no external dependency, no per-GB cost.
+  if (urls.length > 0 && staticAuthSecret) {
+    return mintCoturnCredentials(urls, staticAuthSecret, ttlSeconds, sessionId);
+  }
 
   if (!keyId || !apiToken) {
     return { iceServers: PUBLIC_STUN, ttl: 3600 };

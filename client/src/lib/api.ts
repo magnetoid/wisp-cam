@@ -2,7 +2,7 @@ import type { SessionResponse, TurnResponse } from '@shared/protocol.ts';
 
 export const SERVER_URL: string = import.meta.env.VITE_SERVER_URL ?? 'http://localhost:8080';
 
-const TOKEN_KEY = 'c2c.session';
+const TOKEN_KEY = 'wisp.session';
 
 interface StoredSession {
   token: string;

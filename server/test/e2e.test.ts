@@ -32,7 +32,7 @@ let dataDir = '';
  * loopback address, which would otherwise lock out every subsequent run.
  */
 async function startServer(): Promise<void> {
-  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'c2c-test-'));
+  dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wisp-test-'));
 
   serverProcess = spawn(process.execPath, [serverEntry], {
     env: {
@@ -136,7 +136,7 @@ async function pairTwo(mode: 'video' | 'text' = 'text'): Promise<{
   return { a, b, matchA, matchB };
 }
 
-describe('c2c signaling server', () => {
+describe('Wisp Cam signaling server', () => {
   before(async () => {
     await startServer();
   });
@@ -336,6 +336,53 @@ describe('c2c signaling server', () => {
         nextA.roomId,
         nextB.roomId,
         'the two must not be put straight back together after a skip',
+      );
+    });
+
+    it('lets a dropped client rejoin and match again with the same token', async () => {
+      // What a phone does when it switches network or wakes from background:
+      // the socket dies, and the client comes back with the same session token
+      // but a new socket id.
+      const token = await createSession();
+      const first = await connect(token);
+      openSockets.push(first);
+
+      const partner = await newClient();
+      const initial = once<MatchFound>(first, 'match:found');
+      first.emit('queue:join', { mode: 'text' });
+      partner.emit('queue:join', { mode: 'text' });
+      const firstMatch = await initial;
+
+      const partnerNotified = once<{ reason: string }>(partner, 'peer:left');
+      const partnerRematch = once<MatchFound>(partner, 'match:found', 8000);
+      first.disconnect();
+      assert.equal((await partnerNotified).reason, 'disconnected');
+
+      // Two more waiting users, so both the abandoned partner and the
+      // returning client have someone available.
+      const fresh = await newClient();
+      const alsoFresh = await newClient();
+      fresh.emit('queue:join', { mode: 'text' });
+      alsoFresh.emit('queue:join', { mode: 'text' });
+
+      // Reconnect with the same token and ask for a new partner.
+      const rejoined = await connect(token);
+      openSockets.push(rejoined);
+
+      const secondMatch = once<MatchFound>(rejoined, 'match:found', 8000);
+      rejoined.emit('queue:join', { mode: 'text' });
+
+      const [result, partnerResult] = await Promise.all([secondMatch, partnerRematch]);
+
+      assert.ok(result.roomId, 'a reconnected client must be matchable again');
+      assert.notEqual(result.roomId, firstMatch.roomId, 'it must be a fresh room');
+      // Recent partners are remembered per session, not per socket, so
+      // reconnecting must not hand you straight back to the person you just
+      // dropped away from.
+      assert.notEqual(
+        result.roomId,
+        partnerResult.roomId,
+        'reconnecting must not bypass the recent-partner rule',
       );
     });
 

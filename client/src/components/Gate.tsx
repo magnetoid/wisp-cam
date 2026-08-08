@@ -84,6 +84,7 @@ export default function Gate({ onSession }: GateProps) {
     <main className="gate">
       <div className="gate__inner">
         <header className="gate__header">
+          <p className="gate__wordmark">Wisp Cam</p>
           <h1 className="gate__title">
             talk to
             <br />

@@ -1,0 +1,85 @@
+# Wisp Cam — application stack for Coolify.
+#
+# Create this as: New Resource -> Docker Compose (Git repo),
+#   Docker Compose Location: deploy/coolify/app.compose.yml
+#
+# Then set the domains in the UI (see deploy/COOLIFY.md):
+#   Domains for web        ->  https://wisp.best:80
+#   Domains for signaling  ->  https://api.wisp.best:8080
+#
+# The `:<port>` suffix is not part of the public URL — it tells Traefik which
+# container port to route to. Omitting it makes Traefik guess, which is the
+# usual cause of a 502 here. The scheme must be https:// or no TLS router is
+# created at all.
+#
+# coturn is deliberately NOT in this stack: it needs host networking and raw
+# UDP, so it cannot sit behind the proxy. Deploy coturn.compose.yml separately.
+#
+# Note: no top-level `networks:` — Coolify injects its own, and defining one
+# puts containers on two networks, after which Traefik routes to the wrong IP
+# intermittently.
+
+services:
+  web:
+    build:
+      context: ../..
+      dockerfile: client/Dockerfile
+      args:
+        # Vite inlines this at BUILD time. Every VITE_* variable must have
+        # "Build Variable" ticked in Coolify, or it resolves to empty and the
+        # bundle ships pointing nowhere — with no build error.
+        - VITE_SERVER_URL=${VITE_SERVER_URL}
+    environment:
+      # Seeds a default domain for this service on first deploy; whatever you
+      # set in the UI takes precedence afterwards.
+      - SERVICE_FQDN_WEB_80
+    healthcheck:
+      test: ['CMD', 'wget', '-q', '--spider', 'http://127.0.0.1/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  signaling:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      - SERVICE_FQDN_SIGNALING_8080
+      - NODE_ENV=production
+      - PORT=8080
+      - DATA_DIR=/data
+
+      # Follows whatever domain the web service ends up with.
+      - ALLOWED_ORIGINS=${SERVICE_URL_WEB}
+
+      - JWT_SECRET=${JWT_SECRET}
+      - SESSION_TTL_SECONDS=${SESSION_TTL_SECONDS:-21600}
+
+      - TURNSTILE_SECRET=${TURNSTILE_SECRET}
+      - TURNSTILE_SITE_KEY=${TURNSTILE_SITE_KEY}
+
+      # Points at the separately-deployed coturn. Must NOT be a build variable.
+      - TURN_URLS=${TURN_URLS}
+      - TURN_STATIC_AUTH_SECRET=${TURN_STATIC_AUTH_SECRET}
+      - TURN_TTL_SECONDS=${TURN_TTL_SECONDS:-7200}
+
+      - ABUSE_CONTACT_EMAIL=${ABUSE_CONTACT_EMAIL}
+      - LOG_RETENTION_DAYS=${LOG_RETENTION_DAYS:-30}
+    volumes:
+      # Abuse reports, their evidence, and ban state. Renaming this volume
+      # orphans the existing data — treat the name as immutable.
+      - wisp-data:/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  wisp-data:

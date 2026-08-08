@@ -110,11 +110,12 @@ app.post('/api/session', async (req, res) => {
 
 app.get('/api/ice', async (req, res) => {
   const auth = req.headers.authorization?.replace(/^Bearer\s+/i, '');
-  if (!auth || !verifySessionToken(auth)) {
+  const claims = auth ? verifySessionToken(auth) : null;
+  if (!claims) {
     res.status(401).json({ error: 'unauthorized' });
     return;
   }
-  res.json(await getIceServers());
+  res.json(await getIceServers(claims.sid));
 });
 
 app.get('/api/config', (_req, res) => {
@@ -404,18 +405,18 @@ const pruneTimer = setInterval(pruneLogs, 24 * 60 * 60 * 1000);
 pruneTimer.unref();
 
 server.listen(config.port, () => {
-  console.log(`[c2c] signaling server on :${config.port} (${config.nodeEnv})`);
-  console.log(`[c2c] allowed origins: ${config.allowedOrigins.join(', ')}`);
+  console.log(`[wisp] signaling server on :${config.port} (${config.nodeEnv})`);
+  console.log(`[wisp] allowed origins: ${config.allowedOrigins.join(', ')}`);
   if (!config.turn.keyId) {
-    console.warn('[c2c] no TURN configured — expect ~15-20% of real-world connections to fail');
+    console.warn('[wisp] no TURN configured — expect ~15-20% of real-world connections to fail');
   }
   if (!config.turnstileSecret) {
-    console.warn('[c2c] no Turnstile configured — bot gate is disabled');
+    console.warn('[wisp] no Turnstile configured — bot gate is disabled');
   }
 });
 
 function shutdown(): void {
-  console.log('[c2c] shutting down');
+  console.log('[wisp] shutting down');
   matchmaker.stop();
   io.close();
   server.close(() => process.exit(0));

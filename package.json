@@ -1,9 +1,9 @@
 {
-  "name": "c2c",
+  "name": "wisp-cam",
   "private": true,
   "type": "module",
   "version": "0.1.0",
-  "description": "Anonymous 1-on-1 random video and text chat",
+  "description": "Wisp Cam — anonymous 1-on-1 random video and text chat",
   "workspaces": [
     "server",
     "client"

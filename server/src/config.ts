@@ -36,8 +36,22 @@ export const config = {
   /** Cloudflare Turnstile. When unset, the bot check is skipped (dev only). */
   turnstileSecret: env('TURNSTILE_SECRET'),
 
-  /** Cloudflare Realtime TURN. When unset, clients fall back to public STUN. */
+  /**
+   * TURN relay. Three ways to supply it, tried in this order:
+   *   1. Self-hosted coturn via a shared secret (TURN_URLS + TURN_STATIC_AUTH_SECRET)
+   *   2. Cloudflare Realtime TURN (CLOUDFLARE_TURN_*)
+   *   3. Public STUN only — development, or accept that ~15-20% of real
+   *      connections will fail to traverse NAT.
+   */
   turn: {
+    /** e.g. "turn:turn.wisp.best:3478?transport=udp,turns:turn.wisp.best:5349?transport=tcp" */
+    urls: (env('TURN_URLS') ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+    /** Must match coturn's `static-auth-secret`. */
+    staticAuthSecret: env('TURN_STATIC_AUTH_SECRET'),
+
     keyId: env('CLOUDFLARE_TURN_KEY_ID'),
     apiToken: env('CLOUDFLARE_TURN_API_TOKEN'),
     ttlSeconds: intEnv('TURN_TTL_SECONDS', 2 * 60 * 60),

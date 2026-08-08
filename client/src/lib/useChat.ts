@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { io, type Socket } from 'socket.io-client';
-import { SERVER_URL, fetchIceServers } from './api.ts';
+import { SERVER_URL, clearStoredSession, fetchIceServers } from './api.ts';
 import { PeerSession, type PeerState } from './peer.ts';
 import type {
   ChatBlockReason,
@@ -17,6 +17,8 @@ export type ChatStatus =
   | 'searching'
   | 'connecting'
   | 'connected'
+  /** Our own socket dropped — usually a phone changing network or waking up. */
+  | 'reconnecting'
   | 'ended';
 
 export interface ChatMessage {
@@ -61,12 +63,23 @@ export function useChat(token: string | null) {
   const [queuePosition, setQueuePosition] = useState(0);
   const [banned, setBanned] = useState<{ until: number | null; reason: string } | null>(null);
   const [mediaError, setMediaError] = useState<string | null>(null);
+  /** Reconnection attempts were exhausted; recoverable via `retry()`. */
+  const [connectionLost, setConnectionLost] = useState(false);
+  /** The session token expired or was rejected; the user needs a new one. */
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   const socketRef = useRef<AppSocket | null>(null);
   const peerRef = useRef<PeerSession | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const iceServersRef = useRef<RTCIceServer[] | null>(null);
-  const modeRef = useRef<ChatMode>('video');
+  /**
+   * What the user actually wants: the mode they're chatting in, or null if
+   * they're not trying to chat. Distinct from `status`, which is where the
+   * connection currently is. On a reconnect this is what tells us whether to
+   * rejoin the queue — without it the client silently ends up in no queue at
+   * all while still showing "Searching".
+   */
+  const desiredModeRef = useRef<ChatMode | null>(null);
   const noticeId = useRef(0);
   const messageId = useRef(0);
 
@@ -123,16 +136,73 @@ export function useChat(token: string | null) {
 
     const socket: AppSocket = io(SERVER_URL, {
       auth: { token },
+      // Skip the HTTP long-polling handshake entirely. Polling is what
+      // proxy gzip middleware buffers and breaks, and we never need the
+      // fallback for a browser that already supports WebRTC.
       transports: ['websocket'],
-      reconnectionAttempts: 5,
+      // Mobile networks drop out for far longer than socket.io's default of 5
+      // attempts allows — that gives up after roughly 15 seconds, which a
+      // tunnel or a Wi-Fi/LTE handover comfortably exceeds. Retry for a few
+      // minutes instead of dead-ending the user.
+      reconnectionAttempts: 20,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 10_000,
     });
     socketRef.current = socket;
+
+    /**
+     * Fires on the first connection and on every reconnect. A reconnect gets a
+     * brand-new socket id, and the server released our old room and queue slot
+     * the moment we dropped — so if the user still wants to chat, we have to
+     * ask for a new partner explicitly.
+     */
+    socket.on('connect', () => {
+      const wanted = desiredModeRef.current;
+      if (!wanted) return;
+
+      teardownPeer();
+      setMessages([]);
+      setStatus('searching');
+      socket.emit('queue:join', { mode: wanted });
+    });
+
+    socket.on('disconnect', (reason) => {
+      teardownPeer();
+      setMessages([]);
+
+      // A deliberate server-side disconnect (ban) is terminal; socket.io will
+      // not retry it, and neither should we.
+      if (reason === 'io server disconnect') {
+        desiredModeRef.current = null;
+        setStatus('ended');
+        return;
+      }
+
+      if (desiredModeRef.current) {
+        setStatus('reconnecting');
+        pushNotice('Connection lost. Reconnecting…', 'warn');
+      }
+    });
+
+    socket.io.on('reconnect_failed', () => {
+      // Intent is deliberately preserved: retrying, or simply returning to the
+      // tab, should put the user back in the queue rather than stranding them
+      // connected-but-idle.
+      setStatus('ended');
+      setConnectionLost(true);
+    });
 
     socket.on('connect_error', (err) => {
       if (err.message === 'banned') {
         setBanned({ until: null, reason: 'banned' });
-      } else {
-        pushNotice('Connection problem. Retrying…', 'warn');
+        return;
+      }
+      // An expired or rejected token cannot be retried into working; send the
+      // user back through the entry gate for a fresh one.
+      if (err.message === 'unauthorized') {
+        desiredModeRef.current = null;
+        clearStoredSession();
+        setSessionExpired(true);
       }
     });
 
@@ -204,6 +274,7 @@ export function useChat(token: string | null) {
     });
 
     socket.on('session:banned', ({ until, reason }) => {
+      desiredModeRef.current = null;
       setBanned({ until, reason });
       teardownPeer();
       setStatus('ended');
@@ -217,6 +288,27 @@ export function useChat(token: string | null) {
       socketRef.current = null;
     };
   }, [token, pushNotice, teardownPeer]);
+
+  /**
+   * Phones commonly kill the socket while the tab is backgrounded, and the
+   * browser can sit on a dead connection for a while before noticing. Nudging
+   * it the moment the user comes back makes the recovery feel immediate
+   * instead of taking a reconnect backoff cycle.
+   */
+  useEffect(() => {
+    const onVisibilityChange = (): void => {
+      if (document.visibilityState !== 'visible') return;
+      const socket = socketRef.current;
+      if (socket && !socket.connected && desiredModeRef.current) socket.connect();
+    };
+
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    window.addEventListener('online', onVisibilityChange);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      window.removeEventListener('online', onVisibilityChange);
+    };
+  }, []);
 
   // Release the camera when the component tree unmounts.
   useEffect(() => {
@@ -238,7 +330,7 @@ export function useChat(token: string | null) {
         if (!stream) return;
       }
 
-      modeRef.current = nextMode;
+      desiredModeRef.current = nextMode;
       setMode(nextMode);
       setStatus('searching');
       socketRef.current.emit('queue:join', { mode: nextMode });
@@ -256,6 +348,7 @@ export function useChat(token: string | null) {
   }, [teardownPeer]);
 
   const stop = useCallback(() => {
+    desiredModeRef.current = null;
     socketRef.current?.emit('queue:leave');
     teardownPeer();
     setMessages([]);
@@ -286,10 +379,24 @@ export function useChat(token: string | null) {
 
   /** Called by the local NSFW monitor when it trips on our own camera. */
   const selfReportNsfw = useCallback(() => {
+    desiredModeRef.current = null;
     socketRef.current?.emit('peer:nsfw-selfreport');
     teardownPeer();
     setStatus('ended');
   }, [teardownPeer]);
+
+  /**
+   * Manual retry after reconnection attempts ran out. Cheaper than a reload:
+   * the session token and camera stream are still valid, so this recovers in
+   * place rather than sending the user back through the entry gate.
+   */
+  const retry = useCallback(() => {
+    setConnectionLost(false);
+    const socket = socketRef.current;
+    if (!socket) return;
+    if (socket.connected) socket.disconnect();
+    socket.connect();
+  }, []);
 
   const toggleCamera = useCallback((enabled: boolean) => {
     for (const track of localStreamRef.current?.getVideoTracks() ?? []) track.enabled = enabled;
@@ -310,12 +417,15 @@ export function useChat(token: string | null) {
       queuePosition,
       banned,
       mediaError,
+      connectionLost,
+      sessionExpired,
       start,
       next,
       stop,
       sendMessage,
       report,
       selfReportNsfw,
+      retry,
       toggleCamera,
       toggleMic,
     }),
@@ -329,12 +439,15 @@ export function useChat(token: string | null) {
       queuePosition,
       banned,
       mediaError,
+      connectionLost,
+      sessionExpired,
       start,
       next,
       stop,
       sendMessage,
       report,
       selfReportNsfw,
+      retry,
       toggleCamera,
       toggleMic,
     ],

@@ -16,6 +16,28 @@ export default function ChatShell({ token, onSessionLost }: ChatShellProps) {
     if (chat.banned) clearStoredSession();
   }, [chat.banned]);
 
+  // An expired token can only be replaced by passing the entry gate again.
+  useEffect(() => {
+    if (chat.sessionExpired) onSessionLost();
+  }, [chat.sessionExpired, onSessionLost]);
+
+  if (chat.connectionLost) {
+    return (
+      <main className="centered">
+        <div className="panel">
+          <h1 className="panel__title">Connection lost</h1>
+          <p className="panel__body">
+            We couldn&apos;t reach the server after several attempts. Check your connection and try
+            again.
+          </p>
+          <button className="button button--primary" onClick={chat.retry}>
+            Try again
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   if (chat.banned) {
     const until = chat.banned.until ? new Date(chat.banned.until) : null;
     return (

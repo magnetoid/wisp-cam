@@ -28,7 +28,7 @@ export default function Legal({ page }: LegalProps) {
 
       {page === 'terms' ? (
         <>
-          <h1>Terms of use</h1>
+          <h1>Wisp Cam — terms of use</h1>
           <p className="prose__lede">
             By using this service you agree to these terms. If you do not agree, do not use it.
           </p>
@@ -79,7 +79,7 @@ export default function Legal({ page }: LegalProps) {
         </>
       ) : (
         <>
-          <h1>Privacy policy</h1>
+          <h1>Wisp Cam — privacy policy</h1>
           <p className="prose__lede">
             The short version: your video and audio never touch our servers, we never store your
             messages, and we keep a small amount of connection metadata for a short time so we can
