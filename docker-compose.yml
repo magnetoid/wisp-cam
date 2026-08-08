@@ -35,10 +35,14 @@ services:
       context: .
       dockerfile: client/Dockerfile
       args:
+        # List syntax, not mapping: Coolify merges build args into the service's
+        # `environment`, and mixing mapping args with a list environment yields
+        # "non-string key in services.web.environment" at build time.
+        #
         # Vite inlines this at BUILD time. In Coolify this variable MUST have
         # "Build Variable" ticked, or it resolves to empty here and the bundle
         # ships pointing nowhere — with no build error to warn you.
-        VITE_SERVER_URL: ${VITE_SERVER_URL:-http://localhost:8080}
+        - VITE_SERVER_URL=${VITE_SERVER_URL:-http://localhost:8080}
     restart: unless-stopped
     environment:
       # Seeds a default domain on first deploy; the value set in the Coolify UI
